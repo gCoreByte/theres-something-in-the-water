@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+if [ ! -x .venv/bin/python ]; then
+  python3 -m venv .venv
+fi
+if [ requirements.txt -nt .venv/.installed ] || [ ! -f .venv/.installed ]; then
+  .venv/bin/pip install -q -r requirements.txt
+  touch .venv/.installed
+fi
+case "$(basename "$0")" in
+  plot)
+    exec .venv/bin/python plot_measurements.py "$@"
+    ;;
+  unmix)
+    exec .venv/bin/python unmix.py "$@"
+    ;;
+esac
+exec .venv/bin/python -m tsitw "$@"
