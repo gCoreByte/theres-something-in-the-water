@@ -3,11 +3,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .recording import write_samples
-from .spectrum import CHANNELS, SATURATED, channel_stats
+from .recording import write_frames
+from .spectrum import CHANNELS, MODES, OFF, channel_stats
 
-
-ZERO_DARK = dict.fromkeys(CHANNELS, 0.0)
+MIN_REFERENCE_SNR = 3
+MIN_REFERENCE = 10
 
 
 @dataclass(frozen=True)
@@ -20,25 +20,15 @@ class CalibrationStep:
 
 STEPS = (
     CalibrationStep(
-        "dark",
-        "Dark",
-        "Cover the sensor completely (e.g. with a black cap or cloth) so no outside light reaches it.\n"
-        "If you cannot block all light, skip this step.",
-    ),
-    CalibrationStep(
         "white_ref",
-        "White reference",
-        "Place the white reference (PTFE or matte white paper) at the distance you will measure at.",
-    ),
-    CalibrationStep(
-        "empty_container",
-        "Empty container",
-        "Put the empty, clean container in the measuring position.",
+        "White paper",
+        "Hold the matte white paper against the glass in front of the sensor, at the spot and in the way you will "
+        "use every time.",
     ),
     CalibrationStep(
         "clean_water",
-        "Clean water",
-        "Fill the container with clean water and put it back in exactly the same position.",
+        "Clean tap water",
+        "Fill the clean glass with tap water and put it back in exactly the measuring position.",
     ),
 )
 
@@ -49,70 +39,87 @@ class Calibration:
     path: Path
     created_at: str
     steps: dict
-    references: dict
 
     def has(self, *names):
-        return all(name in self.references for name in names)
+        return all(name in self.steps for name in names)
 
-    def reflectance(self, values):
+    def reference(self, name, mode, channel):
+        stats = self.steps[name]["modes"][mode]
+        mean, std = stats["mean"][channel], stats["std"][channel]
+        if mean is None or mean < MIN_REFERENCE or mean <= MIN_REFERENCE_SNR * (std or 0):
+            return None
+        return mean
+
+    def reflectance(self, frame):
         if not self.has("white_ref"):
             return None
-        return self._normalise(values, self.references["white_ref"])
+        return {mode: self._reflectance(frame.net(mode), mode) for mode in MODES}
 
-    def relative_to_water(self, values):
-        if not self.has("clean_water"):
+    def excess(self, frame):
+        if not self.has("white_ref", "clean_water"):
             return None
-        return self._normalise(values, self.references["clean_water"])
+        return {mode: self._excess(frame.net(mode), mode) for mode in MODES}
 
-    def _normalise(self, values, reference):
-        dark = self.references.get("dark", ZERO_DARK)
+    def _reflectance(self, net, mode):
         result = {}
         for channel in CHANNELS:
-            value, low, high = values[channel], dark[channel], reference[channel]
-            if value == SATURATED or low is None or high is None or high - low <= 0:
-                result[channel] = None
-            else:
-                result[channel] = (value - low) / (high - low)
+            white = self.reference("white_ref", mode, channel)
+            result[channel] = None if white is None or net[channel] is None else net[channel] / white
+        return result
+
+    def _excess(self, net, mode):
+        result = {}
+        for channel in CHANNELS:
+            white = self.reference("white_ref", mode, channel)
+            water = self.steps["clean_water"]["modes"][mode]["mean"][channel]
+            missing = white is None or water is None or net[channel] is None
+            result[channel] = None if missing else (net[channel] - water) / white
         return result
 
     @classmethod
     def load(cls, path):
         data = json.loads((path / "calibration.json").read_text())
-        references = {name: {c: step["mean"][c] for c in CHANNELS} for name, step in data["steps"].items()}
-        return cls(path=path, created_at=data["created_at"], steps=data["steps"], references=references)
+        if not all("modes" in step for step in data["steps"].values()):
+            return None
+        return cls(path=path, created_at=data["created_at"], steps=data["steps"])
 
     @classmethod
     def latest(cls, root):
-        candidates = sorted(p for p in root.glob("*") if (p / "calibration.json").exists())
-        return cls.load(candidates[-1]) if candidates else None
+        candidates = sorted((p for p in root.glob("*") if (p / "calibration.json").exists()), reverse=True)
+        for candidate in candidates:
+            calibration = cls.load(candidate)
+            if calibration:
+                return calibration
+        return None
 
 
-def save_calibration(root, results, samples_per_step, previous=None):
+def save_calibration(root, results, frames_per_step, previous=None):
     created_at = datetime.now()
     path = root / created_at.strftime("%Y%m%d-%H%M%S")
     path.mkdir(parents=True)
     steps = {}
     for step in STEPS:
         if step.name in results:
-            write_samples(path / f"{step.name}.csv", results[step.name])
+            write_frames(path / f"{step.name}.csv", results[step.name])
             steps[step.name] = measured_step(results[step.name])
         elif previous and previous.has(step.name):
             steps[step.name] = reused_step(previous, step.name)
     data = {
-        "created_at": created_at.isoformat(timespec="seconds"), "samples_per_step": samples_per_step, "steps": steps,
+        "created_at": created_at.isoformat(timespec="seconds"), "frames_per_step": frames_per_step, "steps": steps,
     }
     (path / "calibration.json").write_text(json.dumps(data, indent=2))
     return Calibration.load(path)
 
 
-def measured_step(samples):
-    stats = channel_stats(samples)
-    return {
-        "mean": {c: stats[c]["mean"] for c in CHANNELS},
-        "std": {c: stats[c]["std"] for c in CHANNELS},
-        "n": len(samples),
-        "combination": samples[0].combination if samples else None,
-    }
+def measured_step(frames):
+    modes = {OFF: summary(channel_stats([f.readings[OFF].values for f in frames]))}
+    for mode in MODES:
+        modes[mode] = summary(channel_stats([f.net(mode) for f in frames]))
+    return {"frames": len(frames), "modes": modes}
+
+
+def summary(stats):
+    return {"mean": {c: stats[c]["mean"] for c in CHANNELS}, "std": {c: stats[c]["std"] for c in CHANNELS}}
 
 
 def reused_step(previous, name):

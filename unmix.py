@@ -1,21 +1,26 @@
 import argparse
 import itertools
 import json
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 from rich.console import Console
 from rich.table import Table
 
-from plot_measurements import METRICS, SERIES, SURFACE, TEXT, X, load_measurement, save, style_axes
+from plot_measurements import (
+    METRICS, SERIES, SURFACE, TEXT, TEXT_SECONDARY, X, grid_axes, has_metric, hide_unused, load_measurement, measurement_folders,
+    modes_in, save, style_axes,
+)
+from tsitw.calibration import Calibration
 from tsitw.recording import slugify
-from tsitw.spectrum import CHANNELS
+from tsitw.spectrum import CHANNELS, MODE_LABELS, MODES, OFF
 
 PROJECT_DIR = Path(__file__).resolve().parent
+CLEAN_WATER = "clean-water"
 NOISE_FLOOR = 0.05
 WEAK_SIGNAL = 0.05
 SCORE_NOTE = (
@@ -33,15 +38,12 @@ class Problem:
 
     mix: dict
     background: dict
+    modes: list
     ylabel: str
     target: np.ndarray
     components: dict
     sigma: np.ndarray
     usable: np.ndarray
-
-
-def measurement_folders(data_dir):
-    return sorted(p for p in (data_dir / "measurements").glob("*") if (p / "samples.csv").exists())
 
 
 def measurement_type(folder):
@@ -63,7 +65,7 @@ def find_folder(folders, query):
 def select_folders(args):
     folders = measurement_folders(args.data_dir)
     mix = find_folder(folders, args.mix)
-    background = find_folder(folders, args.background)
+    background = None if args.background == CLEAN_WATER else find_folder(folders, args.background)
     if args.materials:
         materials = [find_folder(folders, name) for name in args.materials]
     else:
@@ -73,25 +75,82 @@ def select_folders(args):
     return mix, background, materials
 
 
-def load(folder, prefix):
-    measurement = load_measurement(folder, prefix)
-    if not measurement:
+def shared_modes(folders, requested):
+    shared = [mode for mode in MODES if all(mode in modes_in(folder) for folder in folders)]
+    modes = [mode for mode in shared if not requested or mode in requested]
+    if not modes:
+        sys.exit("The chosen measurements share none of the requested lighting modes.")
+    return modes
+
+
+def load(folder, prefix, modes):
+    parts = [load_measurement(folder, prefix, mode) for mode in modes]
+    if not all(parts):
         sys.exit(f"{folder.name} has no {prefix or 'raw'} values.")
-    return measurement
+    return {
+        "label": parts[0]["label"],
+        "mean": np.concatenate([part["mean"] for part in parts]),
+        "std": np.concatenate([part["std"] for part in parts]),
+        "n": min(part["n"] for part in parts),
+    }
+
+
+def load_clean_water(folder, prefix, modes):
+    calibration = (folder / "calibration.json").exists() and Calibration.load(folder)
+    if not calibration or not calibration.has("clean_water"):
+        sys.exit(f"{folder.name} has no clean water calibration. Pass a measurement with --background.")
+    water = calibration.steps["clean_water"]
+    means, stds = [], []
+    for mode in modes:
+        for channel in CHANNELS:
+            mean, std = water["modes"][mode]["mean"][channel], water["modes"][mode]["std"][channel]
+            mean, std = (math.nan, math.nan) if mean is None else (mean, std)
+            if prefix == "":
+                mean += water["modes"][OFF]["mean"][channel] or 0
+            elif prefix in ("refl_", "excess_"):
+                white = calibration.reference("white_ref", mode, channel) if calibration.has("white_ref") else None
+                mean, std = (math.nan, math.nan) if white is None else (mean / white, std / white)
+                if prefix == "excess_":
+                    mean = 0.0 if math.isfinite(mean) else mean
+            means.append(mean)
+            stds.append(std)
+    meta = folder / "meta.json"
+    name = json.loads(meta.read_text()).get("calibration") if meta.exists() else None
+    label = f"clean water (calibration {name})" if name else "clean water (calibration)"
+    return {"label": label, "mean": np.array(means), "std": np.array(stds), "n": water["frames"]}
+
+
+def warn_mixed_calibrations(folders):
+    names = {}
+    for folder in folders:
+        meta = folder / "meta.json"
+        names[folder.name] = json.loads(meta.read_text()).get("calibration") if meta.exists() else None
+    if len(set(names.values())) > 1:
+        listing = ", ".join(f"{folder} ({name or 'none'})" for folder, name in names.items())
+        console.print(f"[yellow]The measurements use different calibrations: {listing}[/]")
 
 
 def build_problem(args):
     mix_folder, background_folder, material_folders = select_folders(args)
-    prefix, ylabel = METRICS[args.metric]
-    mix = load(mix_folder, prefix)
-    background = load(background_folder, prefix)
-    baseline = np.array(background["mean"])
-    components = {m["label"]: np.array(m["mean"]) - baseline for m in (load(f, prefix) for f in material_folders)}
-    target = np.array(mix["mean"]) - baseline
+    folders = [mix_folder] + ([background_folder] if background_folder else []) + material_folders
+    warn_mixed_calibrations(folders)
+    modes = shared_modes(folders, args.modes)
+    metric = args.metric
+    if metric == "auto":
+        metric = "net" if all(has_metric(f, "net_") for f in folders) else "raw"
+    prefix, ylabel = METRICS[metric]
+    mix = load(mix_folder, prefix, modes)
+    if background_folder:
+        background = load(background_folder, prefix, modes)
+    else:
+        background = load_clean_water(mix_folder, prefix, modes)
+    baseline = background["mean"]
+    components = {m["label"]: m["mean"] - baseline for m in (load(f, prefix, modes) for f in material_folders)}
+    target = mix["mean"] - baseline
     usable = np.isfinite(target) & np.all([np.isfinite(c) for c in components.values()], axis=0)
-    sigma = np.sqrt(np.array(mix["std"]) ** 2 / mix["n"] + np.array(background["std"]) ** 2 / background["n"])
+    sigma = np.sqrt(mix["std"] ** 2 / mix["n"] + background["std"] ** 2 / background["n"])
     sigma = np.maximum(sigma, np.nanmax(sigma[usable]) * NOISE_FLOOR)
-    return Problem(mix, background, ylabel, target, components, sigma, usable)
+    return Problem(mix, background, modes, ylabel, target, components, sigma, usable)
 
 
 def fit_model(problem, combo):
@@ -142,12 +201,14 @@ def results_table(results, limit):
 
 def report(problem, results, limit):
     if not problem.usable.all():
-        dropped = ", ".join(c for c, ok in zip(CHANNELS, problem.usable) if not ok)
-        console.print(f"[yellow]Ignoring channels without values (saturated): {dropped}[/]")
+        features = [f"{MODE_LABELS[m]} {c}" for m in problem.modes for c in CHANNELS]
+        dropped = ", ".join(name for name, ok in zip(features, problem.usable) if not ok)
+        console.print(f"[yellow]Ignoring channels without values (saturated or unlit): {dropped}[/]")
     console.print(
         f"[bold]Mix:[/] {problem.mix['label']}   [bold]Background:[/] {problem.background['label']}   "
         f"[bold]Values:[/] {problem.ylabel}",
     )
+    console.print(f"[bold]Lighting modes fitted together:[/] {', '.join(MODE_LABELS[m] for m in problem.modes)}")
     console.print(f"[bold]Materials tried:[/] {', '.join(problem.components)}\n")
     console.print(results_table(results, limit))
     console.print(f"\n[bold green]Best explanation:[/] {describe(results[0])}")
@@ -170,15 +231,26 @@ def warn_weak_materials(problem):
 
 def plot_fit(problem, best, path):
     parts = [(a, name, a * problem.components[name]) for a, name in zip(best["coef"], best["combo"])]
-    fig, ax = plt.subplots(figsize=(12, 6), facecolor=SURFACE)
-    style_axes(ax, f"{problem.ylabel}, minus background")
-    ax.plot(X, problem.target, color=SERIES[0], label=f"{problem.mix['label']} (measured)", **FIT_LINE)
-    ax.plot(X, sum(part for *_, part in parts), color=SERIES[1], linestyle="--", label="best fit", **FIT_LINE)
-    for index, (a, name, part) in enumerate(parts, 2):
-        color = SERIES[index % len(SERIES)]
-        ax.plot(X, part, color=color, linestyle=":", linewidth=2, label=f"{a:.2f} × {name}")
-    ax.set_title(f"{problem.mix['label']} explained as {describe(best)}", color=TEXT, fontsize=12, loc="left")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False, fontsize=9, labelcolor=TEXT)
+    fit = sum(part for *_, part in parts)
+    fig, axes = grid_axes(len(problem.modes), cols=2, sharey=False)
+    for index, (ax, mode) in enumerate(zip(axes.flat, problem.modes)):
+        block = slice(index * len(CHANNELS), (index + 1) * len(CHANNELS))
+        style_axes(ax, "")
+        ax.set_xticks(X, [str(nm) for nm in X], rotation=90, fontsize=7)
+        ax.tick_params(axis="x", labelbottom=True)
+        ax.set_xlabel("Wavelength (nm)", color=TEXT_SECONDARY, fontsize=9)
+        ax.plot(X, problem.target[block], color=SERIES[0], label=f"{problem.mix['label']} (measured)", **FIT_LINE)
+        ax.plot(X, fit[block], color=SERIES[1], linestyle="--", label="best fit", **FIT_LINE)
+        for color_index, (a, name, part) in enumerate(parts, 2):
+            color = SERIES[color_index % len(SERIES)]
+            ax.plot(X, part[block], color=color, linestyle=":", linewidth=2, label=f"{a:.2f} × {name}")
+        ax.set_title(f"{MODE_LABELS[mode]} LEDs", color=TEXT, fontsize=10, loc="left")
+    hide_unused(axes, len(problem.modes))
+    fig.suptitle(f"{problem.mix['label']} explained as {describe(best)}", color=TEXT, fontsize=12, x=0.01, ha="left")
+    fig.supylabel(f"{problem.ylabel}, minus background", color=TEXT_SECONDARY, fontsize=9)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False, fontsize=9, labelcolor=TEXT)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.97))
     save(fig, path)
 
 
@@ -191,8 +263,17 @@ def parse_args():
         "--materials", nargs="+",
         help="pure measurements to try (default: all except the mix, the background and other mixes)",
     )
-    parser.add_argument("--background", default="tap-water", help="measurement subtracted from all spectra")
-    parser.add_argument("--metric", choices=tuple(METRICS), default="raw", help="values to fit (default: raw)")
+    parser.add_argument(
+        "--background", default=CLEAN_WATER,
+        help="measurement subtracted from all spectra (default: the clean water step of the mix's calibration)",
+    )
+    parser.add_argument(
+        "--metric", choices=("auto",) + tuple(METRICS), default="auto",
+        help="values to fit (default: net counts if every measurement has them, otherwise raw)",
+    )
+    parser.add_argument(
+        "--modes", nargs="+", choices=MODES, help="lighting modes to fit together (default: every shared mode)",
+    )
     parser.add_argument("--max-components", type=int, default=3, help="most materials in one model (default: 3)")
     parser.add_argument("--top", type=int, default=10, help="number of models to list (default: 10)")
     parser.add_argument("--data-dir", type=Path, default=PROJECT_DIR, help="folder that contains measurements/")

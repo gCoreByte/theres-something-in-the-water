@@ -15,5 +15,8 @@ case "$(basename "$0")" in
   unmix)
     exec .venv/bin/python unmix.py "$@"
     ;;
+  server)
+    exec .venv/bin/python -m tsitw --server "$@"
+    ;;
 esac
 exec .venv/bin/python -m tsitw "$@"

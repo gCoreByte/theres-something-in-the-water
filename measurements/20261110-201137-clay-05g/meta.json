@@ -1,0 +1,88 @@
+{
+  "type": "clay-05g",
+  "started_at": "2026-11-10T20:11:37",
+  "finished_at": "2026-11-10T20:52:10",
+  "completed": true,
+  "planned_runs": 10,
+  "frames_per_run": 60,
+  "modes": [
+    "WHITE_IR_UV",
+    "UV",
+    "IR",
+    "WHITE"
+  ],
+  "source": "/dev/cu.usbserial-110",
+  "calibration": "20261110-195005",
+  "runs": [
+    {
+      "file": "run-01.csv",
+      "started_at": "2026-11-10T20:11:37",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:15:40",
+      "completed": true
+    },
+    {
+      "file": "run-02.csv",
+      "started_at": "2026-11-10T20:15:40",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:19:44",
+      "completed": true
+    },
+    {
+      "file": "run-03.csv",
+      "started_at": "2026-11-10T20:19:44",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:23:47",
+      "completed": true
+    },
+    {
+      "file": "run-04.csv",
+      "started_at": "2026-11-10T20:23:47",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:27:50",
+      "completed": true
+    },
+    {
+      "file": "run-05.csv",
+      "started_at": "2026-11-10T20:27:50",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:31:53",
+      "completed": true
+    },
+    {
+      "file": "run-06.csv",
+      "started_at": "2026-11-10T20:31:53",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:35:57",
+      "completed": true
+    },
+    {
+      "file": "run-07.csv",
+      "started_at": "2026-11-10T20:35:57",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:40:00",
+      "completed": true
+    },
+    {
+      "file": "run-08.csv",
+      "started_at": "2026-11-10T20:40:00",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:44:04",
+      "completed": true
+    },
+    {
+      "file": "run-09.csv",
+      "started_at": "2026-11-10T20:44:04",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:48:07",
+      "completed": true
+    },
+    {
+      "file": "run-10.csv",
+      "started_at": "2026-11-10T20:48:07",
+      "frames": 60,
+      "finished_at": "2026-11-10T20:52:10",
+      "completed": true
+    }
+  ]
+}

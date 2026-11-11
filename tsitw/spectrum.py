@@ -11,12 +11,16 @@ COLORS = dict(zip(CHANNELS, (
     "#a35a6e", "#9a7480", "#8f8590", "#8a8a9a", "#7d7f8f", "#707385",
 )))
 SATURATED = -1
+OFF = "OFF"
+MODES = ("WHITE_IR_UV", "UV", "IR", "WHITE")
+FRAME_MODES = (OFF,) + MODES
+MODE_LABELS = {"WHITE_IR_UV": "All", "UV": "UV", "IR": "IR", "WHITE": "White", OFF: "Off"}
 
 
-def channel_stats(samples):
+def channel_stats(spectra):
     stats = {}
     for channel in CHANNELS:
-        values = [s.values[channel] for s in samples if s.values[channel] != SATURATED]
+        values = [s[channel] for s in spectra if s[channel] is not None and s[channel] != SATURATED]
         if values:
             stats[channel] = {"mean": fmean(values), "std": pstdev(values), "n": len(values)}
         else:
